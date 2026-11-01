@@ -1,0 +1,68 @@
+# Сборщик истории «Добавлено»: раз в день качает главную и дописывает updates.json.
+# Ручное управление — через Actions → Run workflow:
+#   mode=live      — скачать главную сейчас (как cron, но вручную)
+#   mode=day       — один день из веб-архива (для первой проверки: date=2010-06-15)
+#   mode=range     — диапазон из веб-архива (напр. 2010-01-01 … 2011-01-01)
+# Для первого раза: запустите mode=day с любой датой и dry_run=true — файл не
+# изменится, а в логе будет видно, что нашлось. Потом тот же запуск без dry_run.
+name: updates-collect
+
+on:
+  schedule:
+    - cron: "17 6 * * *" # раз в день ~09:00 MSK
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "live | day (один день) | range (диапазон из архива)"
+        required: true
+        default: "live"
+      date:
+        description: "День для mode=day (YYYY-MM-DD)"
+        required: false
+        default: ""
+      date_from:
+        description: "Начало диапазона для mode=range (YYYY-MM-DD)"
+        required: false
+        default: "2010-01-01"
+      date_to:
+        description: "Конец диапазона для mode=range (YYYY-MM-DD)"
+        required: false
+        default: "2011-01-01"
+      dry_run:
+        description: "Только показать в логе, файл не менять (true/false)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run collector
+        run: |
+          set -e
+          MODE="${{ inputs.mode }}"
+          [ -z "$MODE" ] && MODE=live
+          ARGS="--mode $MODE --out data/updates.json"
+          if [ "$MODE" = "day" ]; then ARGS="$ARGS --date ${{ inputs.date }}"; fi
+          if [ "$MODE" = "range" ]; then ARGS="$ARGS --from ${{ inputs.date_from }} --to ${{ inputs.date_to }}"; fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run --dump 30"; fi
+          python scripts/collect_updates.py $ARGS
+      - name: Commit updates.json
+        if: ${{ inputs.dry_run != 'true' }}
+        run: |
+          if git diff --quiet -- data/updates.json; then
+            echo "изменений нет"
+            exit 0
+          fi
+          git config user.name "updates-bot"
+          git config user.email "updates-bot@users.noreply.github.com"
+          git add data/updates.json
+          git commit -m "updates: $(date -u +%F) (workflow ${{ inputs.mode || 'schedule' }})"
+          git push
