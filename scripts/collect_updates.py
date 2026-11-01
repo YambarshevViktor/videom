@@ -72,6 +72,13 @@ def fetch_text(url, timeout=40, post_data=None):
     req = urllib.request.Request(url, data=post_data, headers=UA)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         raw = r.read()
+    # веб-архив отдаёт тело как есть — иногда это gzip (магия 1f 8b)
+    if raw[:2] == b"\x1f\x8b":
+        try:
+            import gzip
+            raw = gzip.decompress(raw)
+        except Exception:
+            pass
     # charset из meta или utf-8
     enc = "utf-8"
     try:
@@ -212,8 +219,8 @@ def parse_ru_date(text, seen_at):
     if not m:
         return None
     try:
-        if m.group(9):  # 01.11.2024
-            d, mo, y = int(m.group(9)), int(m.group(10)), int(m.group(11))
+        if m.group(8):  # 01.11.2024
+            d, mo, y = int(m.group(8)), int(m.group(9)), int(m.group(10))
             if y < 100:
                 y += 2000
             return dt.date(y, mo, d)
@@ -260,123 +267,110 @@ def pick_voice(title, tail):
     return cands[-1][:80]
 
 
+# Точная вёрстка блока «Горячие обновления» (сверено со снапшотом 2026-11-01):
+# <div class="b-seriesupdate__block_date">Сегодня <small>(1 ноября 2026)</small></div>
+# <ul class="b-seriesupdate__block_list"><li ...>
+#   <a class="b-seriesupdate__block_list_link" href="/series/.../83412-....html">Тайтл</a>
+#   <span class="season">(4 сезон)</span> ... <span class="cell cell-2">43 серия [<i>(Озвучка)</i>]</span>
+BLOCK_DATE_RE = re.compile(r'b-seriesupdate__block_date">(.*?)</div>', re.S)
+BLOCK_LIST_RE = re.compile(r'<ul class="b-seriesupdate__block_list">(.*?)</ul>', re.S)
+BLOCK_LINK_RE = re.compile(r'<a[^>]*b-seriesupdate__block_list_link[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.S)
+BLOCK_SEASON_RE = re.compile(r'<span class="season">\((\d{1,3})\s*сезон', re.I)
+BLOCK_EP_RE = re.compile(r"(\d{1,4})\s*сери", re.I)
+BLOCK_VOICE_RE = re.compile(r"<i>(.*?)</i>", re.S)
+BLOCK_YEAR_RE = re.compile(r"-(\d{4})\.html$")
+
+
+def block_voice(raw_inner):
+    v = clean_text(raw_inner)
+    if len(v) > 2 and v.startswith("(") and v.endswith(")"):
+        v = v[1:-1].strip()  # (DublikTV) -> DublikTV; «X (Украинский)» не трогаем
+    return v[:80]
+
+
 def parse_updates(html_text, seen_at, source_url=""):
-    """Возвращает список записей. seen_at — дата снапшота/скачивания (окно ~3 дня)."""
+    """Только по блоку «Горячие обновления». Вне блока ссылок не берём вообще —
+    иначе тащим мусор со всей страницы (слайдер, «Популярное»)."""
     if isinstance(seen_at, dt.datetime):
         seen_at = seen_at.date()
-    # позиции всех заголовков дат
-    date_marks = []  # (pos, date)
-    for m in DATE_HDR_RE.finditer(html_text):
-        # берём контекст вокруг: заголовок обычно «Сегодня, 1 ноября» целиком
-        ctx = html_text[max(0, m.start() - 40):m.end() + 10]
-        d = parse_ru_date(ctx, seen_at)
-        if d:
-            date_marks.append((m.start(), d))
-    date_marks.sort()
-
-    # есть ли вообще блок «горячих» — если нет, парсим всю страницу, но помечаем
-    has_hot = bool(HOT_RE.search(html_text or ""))
-
+    html_text = html_text or ""
     records = []
-    for m in ANCHOR_RE.finditer(html_text or ""):
-        href, post_id, inner = m.group(1), m.group(2), m.group(3)
-        title = clean_text(inner)
-        if not title or len(title) < 2:
-            continue
-        # мусорные ссылки (пагинация, «все сериалы») отсекаем по URL-типу
-        path = urllib.parse.urlparse(href).path.lower()
-        if not any(k in path for k in ("/series", "/films", "/film", "/cartoon", "/anime", "/show", "/doc")):
-            # на главной обновления — это почти всегда /series/... или /films/...
-            # остальное пропускаем, чтобы не тащить меню
-            continue
-        try:
-            pid = int(post_id)
-        except ValueError:
-            continue
-        # дата = ближайший заголовок выше ссылки, иначе seen_at
-        date = seen_at
-        for pos, d in date_marks:
-            if pos <= m.start():
-                date = d
+
+    dates = [(m.start(), clean_text(m.group(1))) for m in BLOCK_DATE_RE.finditer(html_text)]
+    lists = [(m.start(), m.group(1)) for m in BLOCK_LIST_RE.finditer(html_text)]
+    if not dates and not lists:
+        return []
+
+    for upos, ul_html in lists:
+        # дата = ближайший заголовок выше списка, скобки в пробелы
+        dtext = ""
+        for dpos, dt_ in dates:
+            if dpos <= upos:
+                dtext = dt_
             else:
                 break
-        # Узкий хвост: серия/озвучка/флаги живут в той же строке, что и ссылка.
-        # Режем хвост по следующей ссылке/блочной границе — иначе в окно
-        # добивают серия и озвучка СОСЕДНЕЙ записи (поймано тестом на фикстуре).
-        raw_tail = html_text[m.end():m.end() + 500]
-        cut = len(raw_tail)
-        low_tail = raw_tail.lower()
-        for pat in ("<a", "</div", "<div", "</li", "<li", "</tr", "<tr", "<h2", "<h3"):
-            i = low_tail.find(pat)
-            if i != -1:
-                cut = min(cut, i)
-        tail = clean_text(raw_tail[:cut])
-        probe = title + " | " + tail
-
-        season, episode = 0, 0
-        ms = SEASON_EP_RE.search(probe)
-        if ms:
-            season, episode = int(ms.group(1)), int(ms.group(2))
-        else:
-            mx = SXXEXX_RE.search(probe)
-            if mx:
-                season, episode = int(mx.group(1)), int(mx.group(2))
+        dtext = dtext.replace("(", " ").replace(")", " ")
+        date = parse_ru_date(dtext, seen_at) or seen_at
+        for li in re.findall(r"<li\b.*?</li>", ul_html, re.S):
+            lm = BLOCK_LINK_RE.search(li)
+            if not lm:
+                continue
+            href, title = lm.group(1), clean_text(lm.group(2))
+            pm = re.search(r"/(\d+)-", href)
+            if not pm or not title or len(title) < 2:
+                continue
+            pid = int(pm.group(1))
+            after = li[lm.end():]
+            probe = clean_text(after)
+            sm = BLOCK_SEASON_RE.search(after)
+            season = int(sm.group(1)) if sm else 0
+            episode = 0
+            em = BLOCK_EP_RE.search(probe)
+            if em:
+                episode = int(em.group(1))
+            voice = ""
+            vm = BLOCK_VOICE_RE.search(after)
+            if vm:
+                voice = block_voice(vm.group(1))
+            path = urllib.parse.urlparse(href).path.lower()
+            typ = "film" if "/film" in path else "series"
+            reupload = bool(REUPLOAD_RE.search(probe))
+            done = bool(DONE_RE.search(probe)) and typ == "series" and not episode
+            vnorm = norm_voice(voice.split(",")[0] if voice else "")
+            if typ == "film":
+                season, episode = 0, 0
+                key = "%d:m:%s" % (pid, vnorm or "-")
+            elif not season and not episode and not done:
+                key = "%d:m:%s" % (pid, vnorm or "-")
+            elif done:
+                key = "%d:done:%s" % (pid, vnorm or "-")
             else:
-                me = EP_ONLY_RE.search(probe)
-                if me:
-                    episode = int(me.group(1))
-                    mso = SEASON_ONLY_RE.search(probe)
-                    if mso:
-                        season = int(mso.group(1))
-        voice = pick_voice(title, tail)
-        # тип по URL
-        if "/series" in path or "/show" in path or "/anime" in path or "/cartoon" in path:
-            typ = "series"
-        elif "/film" in path:
-            typ = "film"
-        else:
-            typ = "series" if (season or episode) else "film"
-        reupload = bool(REUPLOAD_RE.search(probe))
-        done = bool(DONE_RE.search(probe)) and typ == "series" and not episode
-        vnorm = norm_voice(voice.split(",")[0] if voice else "")
-        if typ == "film":
-            season, episode = 0, 0  # у фильмов сезона/серии нет — чистим хвосты
-            key = "%d:m:%s" % (pid, vnorm or "-")
-        elif not season and not episode and not done:
-            key = "%d:m:%s" % (pid, vnorm or "-")
-        elif done:
-            key = "%d:done:%s" % (pid, vnorm or "-")
-        else:
-            key = "%d:s%de%d:%s" % (pid, season, episode, vnorm or "-")
-
-        # что ещё вытащили (предложение по «если что-то важно»):
-        # title/url/type/year как есть + flags; quality intentional НЕ тащим (скачет),
-        # рейтинг НЕ тащим (меняется и врёт в истории).
-        year = 0
-        my = re.search(r"\((19|20)\d{2}\)", probe)
-        if my:
-            try:
-                year = int(my.group(0).strip("()"))
-            except ValueError:
-                year = 0
-        records.append({
-            "key": key,
-            "id": pid,
-            "type": typ,
-            "title": title[:160],
-            "url": href if href.startswith("http") else urllib.parse.urljoin(BASE_URL, href),
-            "season": season,
-            "episode": episode,
-            "voice": voice[:80],
-            "voice_norm": vnorm[:80],
-            "date": date.isoformat(),
-            "seen_at": seen_at.isoformat(),
-            "source": source_url[:160],
-            "reupload": reupload,
-            "completed": done,
-            "has_hot_block": has_hot,
-            "year": year,
-        })
+                key = "%d:s%de%d:%s" % (pid, season, episode, vnorm or "-")
+            year = 0
+            ym = BLOCK_YEAR_RE.search(href)
+            if ym:
+                try:
+                    year = int(ym.group(1))
+                except ValueError:
+                    year = 0
+            records.append({
+                "key": key,
+                "id": pid,
+                "type": typ,
+                "title": title[:160],
+                "url": href if href.startswith("http") else urllib.parse.urljoin(BASE_URL, href),
+                "season": season,
+                "episode": episode,
+                "voice": voice,
+                "voice_norm": vnorm[:80],
+                "date": date.isoformat(),
+                "seen_at": seen_at.isoformat(),
+                "source": source_url[:160],
+                "reupload": reupload,
+                "completed": done,
+                "has_hot_block": True,
+                "year": year,
+            })
     # дедуп внутри одного прогона
     uniq = {}
     for r in records:
