@@ -158,6 +158,18 @@ DATE_HDR_RE = re.compile(
 )
 HOT_RE = re.compile(r"горяч\w*\s+обновлен", re.I)
 
+
+def page_diag(html_text, label):
+    # Короткая диагностика скачанного: видно, отдал ли сервер контент или заглушку.
+    try:
+        m = re.search(r"<title>(.*?)</title>", html_text or "", re.I | re.S)
+        title = clean_text(m.group(1))[:80] if m else "-"
+    except Exception:
+        title = "?"
+    anchors = len(re.findall(r"<a\b", html_text or "", re.I))
+    hot = bool(HOT_RE.search(html_text or ""))
+    print("%s: bytes=%d title=%r hot=%s anchors=%d" % (label, len(html_text or ""), title, hot, anchors))
+
 SEASON_EP_RE = re.compile(r"(\d{1,3})\s*сезон[а-я]*\s*,?\s*(\d{1,4})\s*сери[яию]", re.I)
 SEASON_ONLY_RE = re.compile(r"(\d{1,3})\s*сезон", re.I)
 EP_ONLY_RE = re.compile(r"(\d{1,4})\s*сери[яию]", re.I)
@@ -405,7 +417,19 @@ def merge_db(db, new_records):
 # ---------- режимы ----------
 
 def run_live(out, dry_run, dump):
-    html_text, url = fetch_home_live()
+    try:
+        html_text, url = fetch_home_live()
+    except Exception as e:
+        # Прямой доступ могли закрыть (защита от ботов) — берём свежий снапшот
+        # главной из веб-архива за последние 7 дней. Даты на странице явные,
+        # так что seen_at=сегодня ничему не мешает.
+        print("live недоступен (%s), беру свежий снапшот из архива" % e)
+        now = dt.datetime.now().date()
+        snaps = wayback_snapshots(now - dt.timedelta(days=7), now)
+        if not snaps:
+            raise RuntimeError("ни главной, ни снапшотов в архиве — пусто")
+        s = snaps[-1]
+        html_text, url = fetch_snapshot(s)
     seen = dt.datetime.now().date()
     recs = parse_updates(html_text, seen, url)
     return [("live:%s" % url, html_text, recs)]
@@ -490,6 +514,9 @@ def main():
 
     total = sum(len(b[2]) for b in bundles)
     print("источников: %d, записей спарсено: %d" % (len(bundles), total))
+    for url, html_text, recs in bundles:
+        page_diag(html_text, "got " + url)
+        print("  -> записей: %d" % len(recs))
     if args.dump:
         n = 0
         for url, _, recs in bundles:
