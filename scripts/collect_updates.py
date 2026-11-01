@@ -416,14 +416,28 @@ def merge_db(db, new_records):
 
 # ---------- режимы ----------
 
+def looks_blocked(html_text):
+    # Настоящая главная — сотни КБ и сотни ссылок. Заглушка от защиты (раннеру
+    # отдали 3977 байт, 0 ссылок) — сразу в архив.
+    if not html_text or len(html_text) < 20000:
+        return True
+    if len(re.findall(r"<a\b", html_text, re.I)) < 10:
+        return True
+    return False
+
+
 def run_live(out, dry_run, dump):
+    html_text, url = None, ""
     try:
         html_text, url = fetch_home_live()
+        if looks_blocked(html_text):
+            print("live отдал заглушку (%d байт) — защита от ботов, беру архив" % len(html_text or ""))
+            html_text = None
     except Exception as e:
-        # Прямой доступ могли закрыть (защита от ботов) — берём свежий снапшот
-        # главной из веб-архива за последние 7 дней. Даты на странице явные,
-        # так что seen_at=сегодня ничему не мешает.
         print("live недоступен (%s), беру свежий снапшот из архива" % e)
+    if not html_text:
+        # Прямой доступ закрыт — берём свежий снапшот главной из веб-архива
+        # за последние 7 дней. Даты на странице явные, seen_at=сегодня не мешает.
         now = dt.datetime.now().date()
         snaps = wayback_snapshots(now - dt.timedelta(days=7), now)
         if not snaps:
