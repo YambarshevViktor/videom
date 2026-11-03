@@ -104,8 +104,11 @@ def fetch_home_live():
     raise RuntimeError("не скачалась главная ни с одного зеркала: %s" % last_err)
 
 
-def wayback_snapshots(day_from, day_to, limit=400):
-    """Список снапшотов главной за период. ~1 в неделю, окно каждого ~3 дня."""
+def wayback_snapshots(day_from, day_to, limit=400, thin=True):
+    """Список снапшотов главной за период. CDX отдаёт максимум 1 в день
+    (collapse=день). thin=True прореживает до ~1 в неделю — для ручного
+    backfill-диапазона; thin=False отдаёт все дни — для live-fallback,
+    где важна каждая дата (на главной всего ~2-3 дня обновлений)."""
     q = {
         "url": "rezka.ag/",
         "from": day_from.strftime("%Y%m%d"),
@@ -113,7 +116,7 @@ def wayback_snapshots(day_from, day_to, limit=400):
         "output": "json",
         "filter": "statuscode:200",
         "filter2": "mimetype:text/html",
-        "collapse": "timestamp:8",  # один в день максимум, дальше проредим до ~1/нед
+        "collapse": "timestamp:8",  # один в день максимум
         "limit": str(limit),
     }
     url = WAYBACK_CDX + "?" + urllib.parse.urlencode(q)
@@ -131,8 +134,11 @@ def wayback_snapshots(day_from, day_to, limit=400):
             out.append(snap)
         except Exception:
             continue
-    # прореживаем до ~1 в неделю (окно снапшота ~3 дня — чаще бессмысленно)
+    # прореживаем до ~1 в неделю только для backfill (thin=True);
+    # live-fallback забирает все дни подряд, иначе дыры.
     out.sort()
+    if not thin:
+        return out
     thinned = []
     last = None
     for s in out:
@@ -399,12 +405,13 @@ def merge_db(db, new_records):
             db["records"].append(r)
             have.add((r["key"], r["date"], r.get("reupload", False)))
             added += 1
-    db["records"].sort(key=lambda r: (r.get("date", ""), r.get("key", "")))
-    db["meta"] = dict(db.get("meta", {}), **{
-        "version": 1,
-        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-        "count": len(db["records"]),
-    })
+    if added:
+        db["records"].sort(key=lambda r: (r.get("date", ""), r.get("key", "")))
+        db["meta"] = dict(db.get("meta", {}), **{
+            "version": 1,
+            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+            "count": len(db["records"]),
+        })
     return added
 
 
@@ -430,14 +437,25 @@ def run_live(out, dry_run, dump):
     except Exception as e:
         print("live недоступен (%s), беру свежий снапшот из архива" % e)
     if not html_text:
-        # Прямой доступ закрыт — берём свежий снапшот главной из веб-архива
-        # за последние 7 дней. Даты на странице явные, seen_at=сегодня не мешает.
+        # Прямой доступ закрыт — забираем ВСЕ дневные снапшоты главной
+        # за последние 5 дней (на главной всего ~2-3 дня обновлений,
+        # окно 7 дней давало бы дыры). Каждый парсим со своей датой —
+        # дедуп по (key+date+reupload) сам отсеет уже виденное.
         now = dt.datetime.now().date()
-        snaps = wayback_snapshots(now - dt.timedelta(days=7), now)
+        snaps = wayback_snapshots(now - dt.timedelta(days=5), now, thin=False)
         if not snaps:
             raise RuntimeError("ни главной, ни снапшотов в архиве — пусто")
-        s = snaps[-1]
-        html_text, url = fetch_snapshot(s)
+        print("live недоступен, беру архивные снапшоты за 5 дн: %d" % len(snaps))
+        bundles = []
+        for s in snaps:
+            try:
+                html_text, url = fetch_snapshot(s)
+                recs = parse_updates(html_text, s.date(), url)
+                bundles.append((url, html_text, recs))
+                time.sleep(1)
+            except Exception as e:
+                print("снапшот %s не скачался: %s" % (s, e), file=sys.stderr)
+        return bundles
     seen = dt.datetime.now().date()
     recs = parse_updates(html_text, seen, url)
     return [("live:%s" % url, html_text, recs)]
@@ -542,6 +560,11 @@ def main():
     added = 0
     for _, _, recs in bundles:
         added += merge_db(db, recs)
+    if not added and os.path.exists(args.out):
+        # Ничего нового — файл не трогаем, иначе каждый прогон давал бы
+        # пустой коммит только из-за смены updated_at.
+        print("новых записей дописано: 0, всего: %d — файл не меняем" % len(db["records"]))
+        return 0
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=1)
