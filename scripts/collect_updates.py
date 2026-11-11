@@ -48,7 +48,7 @@ import urllib.request
 
 BASE_URL = "https://rezka.ag/"
 MIRRORS = ["https://rezka.ag/", "https://hdrezka.ag/", "https://rezka-ua.tv/"]
-WAYBACK_CDX = "http://web.archive.org/cdx/search/cdx"
+WAYBACK_CDX = "https://web.archive.org/cdx/search/cdx"
 UA = {"User-Agent": "Mozilla/5.0 (VideoManager-updates-collector; +https://github.com/)"}
 
 MONTHS = {
@@ -109,16 +109,16 @@ def wayback_snapshots(day_from, day_to, limit=400, thin=True):
     (collapse=день). thin=True прореживает до ~1 в неделю — для ручного
     backfill-диапазона; thin=False отдаёт все дни — для live-fallback,
     где важна каждая дата (на главной всего ~2-3 дня обновлений)."""
-    q = {
-        "url": "rezka.ag/",
-        "from": day_from.strftime("%Y%m%d"),
-        "to": day_to.strftime("%Y%m%d"),
-        "output": "json",
-        "filter": "statuscode:200",
-        "filter2": "mimetype:text/html",
-        "collapse": "timestamp:8",  # один в день максимум
-        "limit": str(limit),
-    }
+    q = [
+        ("url", "rezka.ag/"),
+        ("from", day_from.strftime("%Y%m%d")),
+        ("to", day_to.strftime("%Y%m%d")),
+        ("output", "json"),
+        ("filter", "statuscode:200"),
+        ("filter", "mimetype:text/html"),
+        ("collapse", "timestamp:8"),  # один в день максимум
+        ("limit", str(limit)),
+    ]
     url = WAYBACK_CDX + "?" + urllib.parse.urlencode(q)
     try:
         txt = fetch_text(url, timeout=60)
@@ -437,24 +437,31 @@ def run_live(out, dry_run, dump):
     except Exception as e:
         print("live недоступен (%s), беру свежий снапшот из архива" % e)
     if not html_text:
-        # Прямой доступ закрыт — забираем ВСЕ дневные снапшоты главной
-        # за последние 5 дней (на главной всего ~2-3 дня обновлений,
-        # окно 7 дней давало бы дыры). Каждый парсим со своей датой —
-        # дедуп по (key+date+reupload) сам отсеет уже виденное.
+        # Прямой доступ закрыт — забираем последние снапшоты главной из архива.
+        # Окно 30 дней: свежих снапшотов за 5 дней часто ещё нет в индексе CDX
+        # (лаг архива), а часть снапшотов — тоже заглушки защиты (5 КБ).
+        # Берём до 5 самых свежих, заглушки пропускаем по looks_blocked.
         now = dt.datetime.now().date()
-        snaps = wayback_snapshots(now - dt.timedelta(days=5), now, thin=False)
+        snaps = wayback_snapshots(now - dt.timedelta(days=30), now, thin=False)
         if not snaps:
-            raise RuntimeError("ни главной, ни снапшотов в архиве — пусто")
-        print("live недоступен, беру архивные снапшоты за 5 дн: %d" % len(snaps))
+            print("live недоступен и свежих снапшотов в архиве нет — нечего добавлять, выхожу без ошибок")
+            return []
+        snaps = snaps[-5:]
+        print("live недоступен, беру архивные снапшоты: %d" % len(snaps))
         bundles = []
         for s in snaps:
             try:
                 html_text, url = fetch_snapshot(s)
+                if looks_blocked(html_text):
+                    print("снапшот %s — заглушка (%d байт), пропускаю" % (s, len(html_text or "")))
+                    continue
                 recs = parse_updates(html_text, s.date(), url)
                 bundles.append((url, html_text, recs))
                 time.sleep(1)
             except Exception as e:
                 print("снапшот %s не скачался: %s" % (s, e), file=sys.stderr)
+        if not bundles:
+            print("все архивные снапшоты пустые/битые — нечего добавлять, выхожу без ошибок")
         return bundles
     seen = dt.datetime.now().date()
     recs = parse_updates(html_text, seen, url)
@@ -555,6 +562,9 @@ def main():
                 break
     if args.dry_run:
         print("dry-run: файл не меняем")
+        return 0
+    if not bundles:
+        print("источников нет — файл не меняем")
         return 0
     db = load_db(args.out)
     added = 0
